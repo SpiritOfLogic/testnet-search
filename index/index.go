@@ -3,6 +3,7 @@ package index
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -86,6 +87,14 @@ func (idx *Index) DeleteByDomain(domain string) error {
 	return tx.Commit()
 }
 
+// sanitizeFTS5Query wraps the user query in double quotes for literal matching,
+// escaping any embedded quotes. This prevents FTS5 operator injection
+// (column filters, boolean ops, NEAR, etc.).
+func sanitizeFTS5Query(raw string) string {
+	escaped := strings.ReplaceAll(raw, `"`, `""`)
+	return `"` + escaped + `"`
+}
+
 // Search performs a full-text search and returns ranked results with snippets.
 func (idx *Index) Search(query string, page, pageSize int) ([]SearchResult, int, error) {
 	if page < 1 {
@@ -96,9 +105,10 @@ func (idx *Index) Search(query string, page, pageSize int) ([]SearchResult, int,
 	}
 	offset := (page - 1) * pageSize
 
-	// Count total matches.
+	safeQuery := sanitizeFTS5Query(query)
+
 	var total int
-	err := idx.db.QueryRow(`SELECT count(*) FROM pages WHERE pages MATCH ?`, query).Scan(&total)
+	err := idx.db.QueryRow(`SELECT count(*) FROM pages WHERE pages MATCH ?`, safeQuery).Scan(&total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("count results: %w", err)
 	}
@@ -111,7 +121,7 @@ func (idx *Index) Search(query string, page, pageSize int) ([]SearchResult, int,
 		 WHERE pages MATCH ?
 		 ORDER BY rank
 		 LIMIT ? OFFSET ?`,
-		query, pageSize, offset,
+		safeQuery, pageSize, offset,
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("search query: %w", err)

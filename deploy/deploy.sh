@@ -90,7 +90,7 @@ push_key() {
         >/dev/null 2>&1
 }
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes -o IdentitiesOnly=yes"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o IdentitiesOnly=yes"
 
 remote() {
     local inst_id="$1" ip="$2"; shift 2
@@ -264,9 +264,12 @@ USERDATA
         WG_PUBKEY=\$(echo \"\${WG_PRIVKEY}\" | wg pubkey)
 
         RESPONSE=\$(curl -sk -X POST https://${SERVER_IP}:8443/api/v1/clients/register \
-            -H 'Authorization: Bearer ${JOIN_TOKEN}' \
+            -H @- \
             -H 'Content-Type: application/json' \
-            -d \"{\\\"wg_public_key\\\": \\\"\${WG_PUBKEY}\\\"}\")
+            -d \"{\\\"wg_public_key\\\": \\\"\${WG_PUBKEY}\\\"}\" <<AUTHEOF
+Authorization: Bearer ${JOIN_TOKEN}
+AUTHEOF
+        )
 
         API_TOKEN=\$(echo \"\${RESPONSE}\" | jq -r '.api_token')
         TUNNEL_CIDR=\$(echo \"\${RESPONSE}\" | jq -r '.tunnel_cidr')

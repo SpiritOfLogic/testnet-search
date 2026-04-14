@@ -272,5 +272,18 @@ func (c *Crawler) buildHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: transport,
 		Timeout:   30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			host := strings.ToLower(req.URL.Hostname())
+			c.mu.Lock()
+			_, ok := c.allowedDomains[host]
+			c.mu.Unlock()
+			if !ok {
+				return fmt.Errorf("redirect to disallowed domain: %s", host)
+			}
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
 	}
 }

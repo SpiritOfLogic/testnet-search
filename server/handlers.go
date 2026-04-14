@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"html"
 	"html/template"
 	"log"
 	"net/http"
@@ -50,8 +51,11 @@ func (h *handlers) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lucky && len(results) > 0 {
-		http.Redirect(w, r, results[0].URL, http.StatusFound)
-		return
+		target, err := url.Parse(results[0].URL)
+		if err == nil && (target.Scheme == "https" || target.Scheme == "http") && target.Host != "" {
+			http.Redirect(w, r, target.String(), http.StatusFound)
+			return
+		}
 	}
 
 	totalPages := (total + defaultPageSize - 1) / defaultPageSize
@@ -231,11 +235,20 @@ func toResultViews(results []index.SearchResult) []resultView {
 		views[i] = resultView{
 			URL:     r.URL,
 			Title:   r.Title,
-			Snippet: template.HTML(r.Snippet),
+			Snippet: sanitizeSnippet(r.Snippet),
 			Rank:    r.Rank,
 		}
 	}
 	return views
+}
+
+// sanitizeSnippet HTML-escapes the FTS5 snippet, then restores only the
+// known-safe <b>/<\/b> highlight markers produced by snippet().
+func sanitizeSnippet(raw string) template.HTML {
+	safe := html.EscapeString(raw)
+	safe = strings.ReplaceAll(safe, "&lt;b&gt;", "<b>")
+	safe = strings.ReplaceAll(safe, "&lt;/b&gt;", "</b>")
+	return template.HTML(safe)
 }
 
 func parseIntParam(r *http.Request, name string, fallback int) int {
