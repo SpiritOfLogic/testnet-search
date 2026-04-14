@@ -1,1 +1,2 @@
 deploy/.aws-state.json
+deploy/.aws-*-key.pem

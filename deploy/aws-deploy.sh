@@ -1,45 +1,58 @@
 #!/usr/bin/env bash
 #
-# Deploy testnet-search to AWS -- one command, fully running service.
+# Deploy testnet-search to AWS.
 #
 # Usage:
-#   NODE_SECRET=mysecret JOIN_TOKEN=xxx SERVER_IP=1.2.3.4 bash deploy/deploy.sh deploy
-#   bash deploy/deploy.sh test [--quick]
-#   bash deploy/deploy.sh restart
-#   bash deploy/deploy.sh teardown
-#   bash deploy/deploy.sh status
-#   bash deploy/deploy.sh ssh [-- <remote command>]
+#   bash deploy/aws-deploy.sh deploy          # Provision + deploy
+#   bash deploy/aws-deploy.sh teardown        # Soft teardown (keeps EIP + data volume)
+#   bash deploy/aws-deploy.sh teardown --full # Full teardown (destroys everything)
+#   bash deploy/aws-deploy.sh status          # Instance state + health check
+#   bash deploy/aws-deploy.sh ssh             # Interactive SSH session
+#   bash deploy/aws-deploy.sh redeploy        # Re-upload code + restart
+#   bash deploy/aws-deploy.sh restart         # Restart services only
+#   bash deploy/aws-deploy.sh logs            # Tail service logs
+#   bash deploy/aws-deploy.sh test [--quick]  # Verify deployment health
+#   bash deploy/aws-deploy.sh reindex         # Re-crawl all seed domains
+#
+# Required env vars (deploy only):
+#   SERVER_URL    Testnet control plane URL
+#   NODE_NAME     Node name in nodes.yaml
+#   NODE_SECRET   Shared secret from nodes.yaml
 #
 # Prerequisites:
 #   - AWS CLI configured (aws sts get-caller-identity)
 #   - Existing agent-testnet deployed (deploy/.aws-state.json in agent-testnet repo)
 #   - Join token and server IP obtained from the testnet server operator
 #
-# After deploy, ask the server operator to add the following to nodes.yaml
-# and reload the server (SIGHUP). The deploy command prints the exact YAML.
-#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-STATE_FILE="${SCRIPT_DIR}/.aws-state.json"
+STATE_FILE="${STATE_FILE:-${SCRIPT_DIR}/.aws-state.json}"
 
 TESTNET_DIR="${PROJECT_DIR}/../agent-testnet"
 TESTNET_STATE="${TESTNET_DIR}/deploy/.aws-state.json"
 
-REGION="eu-west-1"
+REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo "eu-west-1")}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
-NODE_NAME="search"
+NODE_NAME="${NODE_NAME:-search}"
 NODE_SECRET="${NODE_SECRET:-}"
 JOIN_TOKEN="${JOIN_TOKEN:-}"
-SERVER_IP="${SERVER_IP:-}"
+SERVER_URL="${SERVER_URL:-}"
 
 TOOLKIT_VERSION="${TOOLKIT_VERSION:-latest}"
 
+STACK_TAG="testnet-stack"
+STACK_VALUE="${STACK_VALUE:-agent-testnet}"
+STACK_PREFIX="${STACK_PREFIX:-testnet}"
+
+DATA_MOUNT="/var/lib/testnet-search"
+DATA_VOL_SIZE=10
+
 # ---- helpers ----
 
-info()  { printf "\033[1;34m==>\033[0m %s\n" "$*"; }
-warn()  { printf "\033[1;33mWARN:\033[0m %s\n" "$*"; }
+info()  { printf "\033[1;34m==>\033[0m %s\n" "$*" >&2; }
+warn()  { printf "\033[1;33mWARN:\033[0m %s\n" "$*" >&2; }
 err()   { printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; exit 1; }
 
 save_state() {
@@ -47,7 +60,7 @@ save_state() {
     [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
     local tmp="${STATE_FILE}.tmp"
     python3 -c "
-import json, sys
+import json
 with open('$STATE_FILE') as f: state = json.load(f)
 state['$key'] = '$value'
 with open('$tmp', 'w') as f: json.dump(state, f, indent=2)
@@ -63,6 +76,10 @@ import json
 with open('$file') as f: state = json.load(f)
 print(state.get('$key', ''))
 "
+}
+
+tag_spec() {
+    echo "ResourceType=$1,Tags=[{Key=${STACK_TAG},Value=${STACK_VALUE}},{Key=Name,Value=${STACK_PREFIX}-$2}]"
 }
 
 find_key_file() {
@@ -92,7 +109,7 @@ push_key() {
 
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o IdentitiesOnly=yes"
 
-remote() {
+remote_exec() {
     local inst_id="$1" ip="$2"; shift 2
     push_key "$inst_id"
     ssh $SSH_OPTS -i "$KEY_FILE" "ubuntu@${ip}" "$@"
@@ -106,6 +123,7 @@ remote_copy() {
 
 wait_for_ssh() {
     local inst_id="$1" ip="$2" max_attempts=40 attempt=0
+    ssh-keygen -R "$ip" 2>/dev/null || true
     info "Waiting for SSH on ${ip}..."
     while [ $attempt -lt $max_attempts ]; do
         if push_key "$inst_id" 2>/dev/null && \
@@ -127,19 +145,229 @@ resolve_key() {
     [ -n "$KEY_FILE" ] || err "SSH key not found. Set SSH_KEY=/path/to/key.pem or run deploy first."
 }
 
+# ---- EIP helpers ----
+
+ensure_eip() {
+    EIP_ALLOC=$(load_state "eip_alloc_id")
+    EIP_PUBLIC=$(load_state "eip_public_ip")
+
+    if [ -n "$EIP_ALLOC" ]; then
+        local eip_state
+        eip_state=$(aws ec2 describe-addresses --region "$REGION" \
+            --allocation-ids "$EIP_ALLOC" \
+            --query 'Addresses[0].PublicIp' --output text 2>/dev/null || echo "")
+        if [ -n "$eip_state" ] && [ "$eip_state" != "None" ]; then
+            EIP_PUBLIC="$eip_state"
+            info "Reusing existing EIP: ${EIP_PUBLIC} (${EIP_ALLOC})"
+            return 0
+        fi
+        warn "EIP ${EIP_ALLOC} no longer exists, allocating new one"
+    fi
+
+    info "Allocating Elastic IP..."
+    EIP_ALLOC=$(aws ec2 allocate-address --region "$REGION" --domain vpc \
+        --tag-specifications "$(tag_spec "elastic-ip" "search-eip")" \
+        --query 'AllocationId' --output text)
+    EIP_PUBLIC=$(aws ec2 describe-addresses --region "$REGION" \
+        --allocation-ids "$EIP_ALLOC" \
+        --query 'Addresses[0].PublicIp' --output text)
+    save_state "eip_alloc_id" "$EIP_ALLOC"
+    save_state "eip_public_ip" "$EIP_PUBLIC"
+    info "Allocated EIP: ${EIP_PUBLIC} (${EIP_ALLOC})"
+}
+
+associate_eip() {
+    local instance_id="$1"
+    info "Associating EIP ${EIP_PUBLIC} with instance ${instance_id}..."
+    aws ec2 associate-address --region "$REGION" \
+        --instance-id "$instance_id" \
+        --allocation-id "$EIP_ALLOC" >/dev/null
+}
+
+# ---- EBS volume helpers ----
+
+ensure_volume() {
+    local role="$1" size="$2" az="$3"
+    local vol_id
+    vol_id=$(load_state "vol_${role}")
+
+    if [ -n "$vol_id" ]; then
+        local vol_state
+        vol_state=$(aws ec2 describe-volumes --region "$REGION" \
+            --volume-ids "$vol_id" \
+            --query 'Volumes[0].State' --output text 2>/dev/null || echo "")
+        if [ -n "$vol_state" ] && [ "$vol_state" != "None" ]; then
+            info "Reusing existing volume: ${vol_id} (${vol_state})"
+            echo "$vol_id"
+            return 0
+        fi
+        warn "Volume ${vol_id} no longer exists, creating new one"
+    fi
+
+    info "Creating ${size} GiB GP3 data volume in ${az}..."
+    vol_id=$(aws ec2 create-volume --region "$REGION" \
+        --availability-zone "$az" \
+        --size "$size" \
+        --volume-type gp3 \
+        --tag-specifications "$(tag_spec "volume" "search-data")" \
+        --query 'VolumeId' --output text)
+    save_state "vol_${role}" "$vol_id"
+    save_state "az" "$az"
+    info "Created volume: ${vol_id}"
+
+    aws ec2 wait volume-available --region "$REGION" --volume-ids "$vol_id"
+    echo "$vol_id"
+}
+
+attach_and_mount_volume() {
+    local vol_id="$1" instance_id="$2" ip="$3" key="$4" mount_point="$5"
+
+    local vol_state
+    vol_state=$(aws ec2 describe-volumes --region "$REGION" \
+        --volume-ids "$vol_id" \
+        --query 'Volumes[0].State' --output text)
+
+    if [ "$vol_state" = "in-use" ]; then
+        local attached_to
+        attached_to=$(aws ec2 describe-volumes --region "$REGION" \
+            --volume-ids "$vol_id" \
+            --query 'Volumes[0].Attachments[0].InstanceId' --output text)
+        if [ "$attached_to" = "$instance_id" ]; then
+            info "Volume ${vol_id} already attached to ${instance_id}"
+        else
+            err "Volume ${vol_id} attached to different instance ${attached_to}"
+        fi
+    else
+        info "Attaching volume ${vol_id} to ${instance_id}..."
+        aws ec2 attach-volume --region "$REGION" \
+            --volume-id "$vol_id" \
+            --instance-id "$instance_id" \
+            --device /dev/xvdf >/dev/null
+        aws ec2 wait volume-in-use --region "$REGION" --volume-ids "$vol_id"
+        sleep 5
+    fi
+
+    info "Mounting volume at ${mount_point}..."
+    remote_exec "$instance_id" "$ip" "
+        set -e
+        # Detect device: Nitro instances use /dev/nvme1n1, Xen uses /dev/xvdf
+        if [ -b /dev/nvme1n1 ]; then
+            DEV=/dev/nvme1n1
+        elif [ -b /dev/xvdf ]; then
+            DEV=/dev/xvdf
+        else
+            echo 'Waiting for block device...'
+            for i in \$(seq 1 30); do
+                [ -b /dev/nvme1n1 ] && { DEV=/dev/nvme1n1; break; }
+                [ -b /dev/xvdf ]    && { DEV=/dev/xvdf; break; }
+                sleep 2
+            done
+            [ -n \"\${DEV:-}\" ] || { echo 'ERROR: no block device found'; exit 1; }
+        fi
+        echo \"Using device: \${DEV}\"
+
+        # Format only if not already formatted
+        if ! sudo blkid \"\${DEV}\" >/dev/null 2>&1; then
+            echo 'New volume -- formatting as ext4...'
+            sudo mkfs.ext4 -q \"\${DEV}\"
+        else
+            echo 'Volume already formatted, skipping mkfs'
+        fi
+
+        sudo mkdir -p ${mount_point}
+        if ! mountpoint -q ${mount_point}; then
+            sudo mount \"\${DEV}\" ${mount_point}
+        fi
+        sudo chown ubuntu:ubuntu ${mount_point}
+
+        # Persist mount across reboots
+        if ! grep -q '${mount_point}' /etc/fstab; then
+            UUID=\$(sudo blkid -s UUID -o value \"\${DEV}\")
+            echo \"UUID=\${UUID} ${mount_point} ext4 defaults,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
+        fi
+    "
+    info "Volume mounted at ${mount_point}"
+}
+
+detach_volume() {
+    local role="$1"
+    local vol_id
+    vol_id=$(load_state "vol_${role}")
+    [ -n "$vol_id" ] || return 0
+
+    local vol_state
+    vol_state=$(aws ec2 describe-volumes --region "$REGION" \
+        --volume-ids "$vol_id" \
+        --query 'Volumes[0].State' --output text 2>/dev/null || echo "")
+
+    if [ "$vol_state" = "in-use" ]; then
+        info "Detaching volume ${vol_id}..."
+        aws ec2 detach-volume --region "$REGION" --volume-id "$vol_id" >/dev/null 2>&1 || true
+        aws ec2 wait volume-available --region "$REGION" --volume-ids "$vol_id" 2>/dev/null || true
+        info "Volume ${vol_id} detached"
+    fi
+}
+
+delete_volume() {
+    local role="$1"
+    local vol_id
+    vol_id=$(load_state "vol_${role}")
+    [ -n "$vol_id" ] || return 0
+
+    info "Deleting volume ${vol_id}..."
+    aws ec2 delete-volume --region "$REGION" --volume-id "$vol_id" 2>/dev/null || true
+    info "Volume ${vol_id} deleted"
+}
+
+# ---- source packaging ----
+
+package_source() {
+    info "Packaging source code..."
+    STAGING=$(mktemp -d)
+    trap "rm -rf '$STAGING'" EXIT
+    mkdir -p "${STAGING}/testnet-search"
+    rsync -a --exclude='.DS_Store' --exclude='testnet-search' \
+        --exclude='deploy/.aws-state.json' --exclude='data/' \
+        "$PROJECT_DIR/" "${STAGING}/testnet-search/"
+    tar -C "$STAGING" -czf /tmp/testnet-search-src.tar.gz .
+}
+
+upload_and_build() {
+    local instance_id="$1" ip="$2"
+
+    info "Copying source to instance..."
+    remote_copy "$instance_id" /tmp/testnet-search-src.tar.gz "ubuntu@${ip}:/tmp/"
+
+    info "Building testnet-search on instance..."
+    remote_exec "$instance_id" "$ip" "
+        set -e
+        mkdir -p ~/build && cd ~/build
+        rm -rf testnet-search
+        tar xzf /tmp/testnet-search-src.tar.gz
+        cd testnet-search
+        CGO_ENABLED=1 go build -tags fts5 -o testnet-search . 2>&1
+        sudo mv testnet-search /usr/local/bin/
+        sudo chmod +x /usr/local/bin/testnet-search
+    "
+    info "Binary built and installed"
+}
+
 # ---- deploy ----
 
 do_deploy() {
     info "Deploying testnet-search to AWS (${REGION})"
 
-    # Validate inputs
     [ -n "$NODE_SECRET" ] || err "NODE_SECRET is required"
+    [ -n "$NODE_NAME" ]   || err "NODE_NAME is required"
     [ -n "$JOIN_TOKEN" ]  || err "JOIN_TOKEN is required (obtain from the testnet server operator)"
-    [ -n "$SERVER_IP" ]   || err "SERVER_IP is required (public IP of the testnet server)"
+    [ -n "$SERVER_URL" ]  || err "SERVER_URL is required (e.g. https://1.2.3.4:8443)"
     [ -f "$TESTNET_STATE" ] || err "Agent-testnet state not found at ${TESTNET_STATE}. Deploy agent-testnet first."
     aws sts get-caller-identity >/dev/null 2>&1 || err "AWS CLI not configured"
 
-    # Load infra from testnet state (VPC/subnet/SG -- not the server itself)
+    # Extract bare host/IP from SERVER_URL for WireGuard endpoint
+    SERVER_HOST=$(echo "$SERVER_URL" | sed -E 's|^https?://||; s|:[0-9]+$||; s|/.*||')
+    [ -n "$SERVER_HOST" ] || err "Could not parse host from SERVER_URL: ${SERVER_URL}"
+
     KEY_FILE=$(load_state "key_file" "$TESTNET_STATE")
     SUBNET_ID=$(load_state "subnet_id" "$TESTNET_STATE")
     SG_NODE=$(load_state "sg_node" "$TESTNET_STATE")
@@ -148,21 +376,25 @@ do_deploy() {
     [ -n "$SUBNET_ID" ] || err "No subnet_id in testnet state"
     [ -n "$SG_NODE" ]   || err "No sg_node in testnet state"
     save_state "key_file" "$KEY_FILE"
-    save_state "server_ip" "$SERVER_IP"
+    save_state "server_url" "$SERVER_URL"
 
-    info "Testnet server at ${SERVER_IP}"
+    info "Testnet server at ${SERVER_URL}"
 
     # Teardown old search instance if re-deploying
-    OLD_INST=$(load_state "instance_id" 2>/dev/null || echo "")
+    OLD_INST=$(load_state "instance_search" 2>/dev/null || echo "")
     if [ -n "$OLD_INST" ]; then
         OLD_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$OLD_INST" \
             --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "terminated")
         if [ "$OLD_STATE" = "running" ]; then
             info "Terminating old search instance ${OLD_INST}..."
+            detach_volume "search"
             aws ec2 terminate-instances --region "$REGION" --instance-ids "$OLD_INST" >/dev/null 2>&1 || true
             aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$OLD_INST" 2>/dev/null || true
         fi
     fi
+
+    # EIP (allocate or reuse before launch so we know the stable IP)
+    ensure_eip
 
     # Find AMI
     info "Finding Ubuntu 24.04 AMI..."
@@ -176,7 +408,6 @@ do_deploy() {
     [ "$AMI_ID" != "None" ] && [ -n "$AMI_ID" ] || err "Could not find Ubuntu 24.04 AMI"
     info "Using AMI: ${AMI_ID}"
 
-    # Launch instance with cloud-init that installs deps + testnet-toolkit
     USER_DATA=$(cat <<'USERDATA'
 #!/bin/bash
 set -e
@@ -184,7 +415,6 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y golang-go gcc libsqlite3-dev wireguard-tools jq curl dnsutils
 
-# Install testnet-toolkit
 ARCH=$(dpkg --print-architecture)
 TOOLKIT_URL="https://github.com/SpiritOfLogic/agent-testnet/releases/latest/download/testnet-toolkit-linux-${ARCH}"
 curl -fsSL -o /usr/local/bin/testnet-toolkit "$TOOLKIT_URL"
@@ -201,69 +431,57 @@ USERDATA
         --subnet-id "$SUBNET_ID" \
         --security-group-ids "$SG_NODE" \
         --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=testnet-search},{Key=testnet-stack,Value=agent-testnet}]" \
+        --tag-specifications "$(tag_spec "instance" "search")" \
         --user-data "$USER_DATA" \
         --query 'Instances[0].InstanceId' --output text)
-    save_state "instance_id" "$INSTANCE_ID"
+    save_state "instance_search" "$INSTANCE_ID"
     info "Instance: ${INSTANCE_ID}"
 
     info "Waiting for instance to be running..."
     aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 
-    IP_SEARCH=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
-        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    # Associate EIP with the new instance
+    associate_eip "$INSTANCE_ID"
+    IP_SEARCH="$EIP_PUBLIC"
     save_state "ip_search" "$IP_SEARCH"
-    info "Search instance IP: ${IP_SEARCH}"
+    info "Search instance IP: ${IP_SEARCH} (Elastic IP)"
+
+    # Get instance AZ for data volume
+    INSTANCE_AZ=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
 
     # Wait for SSH + cloud-init
     wait_for_ssh "$INSTANCE_ID" "$IP_SEARCH"
 
     info "Waiting for package installation (cloud-init)..."
     for _ in $(seq 1 60); do
-        if remote "$INSTANCE_ID" "$IP_SEARCH" "test -f /var/lib/cloud/instance/boot-finished" 2>/dev/null; then
+        if remote_exec "$INSTANCE_ID" "$IP_SEARCH" "test -f /var/lib/cloud/instance/boot-finished" 2>/dev/null; then
             break
         fi
         sleep 5
     done
     info "Cloud-init finished"
 
-    remote "$INSTANCE_ID" "$IP_SEARCH" "go version" || err "Go not installed on instance"
-    remote "$INSTANCE_ID" "$IP_SEARCH" "testnet-toolkit --help >/dev/null 2>&1" || err "testnet-toolkit not installed on instance"
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "go version" || err "Go not installed on instance"
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "testnet-toolkit --help >/dev/null 2>&1" || err "testnet-toolkit not installed on instance"
 
-    # Copy source + build (no agent-testnet dependency needed)
-    info "Packaging source code..."
-    STAGING=$(mktemp -d)
-    trap "rm -rf '$STAGING'" EXIT
-    mkdir -p "${STAGING}/testnet-search"
-    rsync -a --exclude='.DS_Store' --exclude='testnet-search' \
-        --exclude='deploy/.aws-state.json' --exclude='data/' \
-        "$PROJECT_DIR/" "${STAGING}/testnet-search/"
-    tar -C "$STAGING" -czf /tmp/testnet-search-src.tar.gz .
+    # Attach data volume
+    VOL_ID=$(ensure_volume "search" "$DATA_VOL_SIZE" "$INSTANCE_AZ")
+    attach_and_mount_volume "$VOL_ID" "$INSTANCE_ID" "$IP_SEARCH" "$KEY_FILE" "$DATA_MOUNT"
 
-    info "Copying source to instance..."
-    remote_copy "$INSTANCE_ID" /tmp/testnet-search-src.tar.gz "ubuntu@${IP_SEARCH}:/tmp/"
-
-    info "Building testnet-search on instance..."
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
-        set -e
-        mkdir -p ~/build && cd ~/build
-        tar xzf /tmp/testnet-search-src.tar.gz
-        cd testnet-search
-        CGO_ENABLED=1 go build -tags fts5 -o testnet-search . 2>&1
-        sudo mv testnet-search /usr/local/bin/
-        sudo chmod +x /usr/local/bin/testnet-search
-    "
-    info "Binary built and installed"
+    # Copy source + build
+    package_source
+    upload_and_build "$INSTANCE_ID" "$IP_SEARCH"
 
     # Register WG client + set up tunnel
     info "Setting up WireGuard tunnel..."
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
         set -e
 
         WG_PRIVKEY=\$(wg genkey)
         WG_PUBKEY=\$(echo \"\${WG_PRIVKEY}\" | wg pubkey)
 
-        RESPONSE=\$(curl -sk -X POST https://${SERVER_IP}:8443/api/v1/clients/register \
+        RESPONSE=\$(curl -sk -X POST ${SERVER_URL}/api/v1/clients/register \
             -H @- \
             -H 'Content-Type: application/json' \
             -d \"{\\\"wg_public_key\\\": \\\"\${WG_PUBKEY}\\\"}\" <<AUTHEOF
@@ -292,7 +510,7 @@ Address = \${TUNNEL_IP}
 
 [Peer]
 PublicKey = \${SERVER_WG_KEY}
-Endpoint = ${SERVER_IP}:51820
+Endpoint = ${SERVER_HOST}:51820
 AllowedIPs = 10.99.0.0/16, 10.100.0.0/16
 PersistentKeepalive = 25
 WGEOF
@@ -314,10 +532,9 @@ WGEOF
         echo 'Testing DNS through tunnel...'
         dig @\${DNS_IP} +short +timeout=5 google.com || echo '(DNS not resolving yet -- will work after node is registered on the server)'
 
-        # Create dirs and env file for toolkit + services
-        sudo mkdir -p /etc/testnet-search /etc/testnet/certs /var/lib/testnet-search
+        sudo mkdir -p /etc/testnet-search /etc/testnet/certs ${DATA_MOUNT}
         sudo tee /etc/testnet-search/env > /dev/null <<ENVEOF
-SERVER_URL=https://${SERVER_IP}:8443
+SERVER_URL=${SERVER_URL}
 NODE_SECRET=${NODE_SECRET}
 API_TOKEN=\${API_TOKEN}
 DNS_IP=\${DNS_IP}
@@ -331,7 +548,7 @@ ENVEOF
     for unit in testnet-search-server.service testnet-search-crawler.service testnet-search-seeds.service testnet-search-seeds.timer; do
         remote_copy "$INSTANCE_ID" "${SCRIPT_DIR}/${unit}" "ubuntu@${IP_SEARCH}:/tmp/"
     done
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
         sudo mv /tmp/testnet-search-server.service /etc/systemd/system/
         sudo mv /tmp/testnet-search-crawler.service /etc/systemd/system/
         sudo mv /tmp/testnet-search-seeds.service /etc/systemd/system/
@@ -340,19 +557,18 @@ ENVEOF
         sudo systemctl enable testnet-search-server testnet-search-crawler testnet-search-seeds.timer
     "
 
-    # Print operator instructions (node registration must be done by the server operator)
     echo ""
     echo "============================================"
     echo "  Instance ready -- node registration needed"
     echo "============================================"
     echo ""
     echo "  Instance:  ${INSTANCE_ID} (${INSTANCE_TYPE})"
-    echo "  Public IP: ${IP_SEARCH}"
+    echo "  Public IP: ${IP_SEARCH} (Elastic IP)"
     echo ""
     echo "  Ask the testnet server operator to add the following"
     echo "  entry to nodes.yaml and reload (kill -HUP <pid>):"
     echo ""
-    echo "    - name: \"search\""
+    echo "    - name: \"${NODE_NAME}\""
     echo "      address: \"${IP_SEARCH}:443\""
     echo "      secret: \"${NODE_SECRET}\""
     echo "      domains:"
@@ -362,7 +578,7 @@ ENVEOF
     echo "  Once the operator confirms the node is registered,"
     echo "  start the service:"
     echo ""
-    echo "    bash deploy/deploy.sh restart"
+    echo "    bash deploy/aws-deploy.sh restart"
     echo ""
     echo "  Or if you know the node is already registered:"
     echo ""
@@ -370,7 +586,7 @@ ENVEOF
     # Start services
     info "Starting testnet-search services..."
     sleep 3
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
         sudo systemctl start testnet-search-server
         sleep 3
         sudo systemctl start testnet-search-crawler
@@ -398,10 +614,10 @@ ENVEOF
 
     echo ""
     echo "  Commands:"
-    echo "    bash deploy/deploy.sh test       # verify everything works"
-    echo "    bash deploy/deploy.sh restart     # restart + refetch certs"
-    echo "    bash deploy/deploy.sh ssh         # shell into the instance"
-    echo "    bash deploy/deploy.sh teardown    # terminate the instance"
+    echo "    bash deploy/aws-deploy.sh test       # verify everything works"
+    echo "    bash deploy/aws-deploy.sh restart     # restart + refetch certs"
+    echo "    bash deploy/aws-deploy.sh ssh         # shell into the instance"
+    echo "    bash deploy/aws-deploy.sh teardown    # soft teardown (keeps EIP + data)"
     echo ""
 }
 
@@ -422,10 +638,10 @@ do_test() {
     t_val() { echo "$CHECK_OUTPUT" | grep "^${1}=" | head -1 | cut -d= -f2-; }
 
     local INSTANCE_ID IP_SEARCH
-    INSTANCE_ID=$(load_state "instance_id")
+    INSTANCE_ID=$(load_state "instance_search")
     IP_SEARCH=$(load_state "ip_search")
 
-    [ -n "$INSTANCE_ID" ] || err "instance_id missing from state"
+    [ -n "$INSTANCE_ID" ] || err "instance_search missing from state"
     [ -n "$IP_SEARCH" ]   || err "ip_search missing from state"
 
     echo ""
@@ -436,8 +652,6 @@ do_test() {
 
     local ssh_ok=false
     if ! $quick; then ssh_ok=true; fi
-
-    # -- EC2 instance --
 
     t_section "EC2 Instance"
 
@@ -457,8 +671,6 @@ do_test() {
         t_fail "Instance status checks: instance=${status_ok} system=${system_ok}"
     fi
 
-    # -- On-instance checks (single batched SSH call) --
-
     t_section "On-Instance Checks"
 
     if ! $ssh_ok; then
@@ -470,7 +682,7 @@ do_test() {
         t_skip "Process health"
     else
         local CHECK_OUTPUT
-        CHECK_OUTPUT=$(remote "$INSTANCE_ID" "$IP_SEARCH" "
+        CHECK_OUTPUT=$(remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
             echo 'MARKER_SSH_OK'
 
             echo \"wg_active=\$(systemctl is-active wg-quick@wg0 2>/dev/null || echo inactive)\"
@@ -530,7 +742,9 @@ do_test() {
             echo \"toolkit_installed=\$(testnet-toolkit --help >/dev/null 2>&1 && echo yes || echo no)\"
 
             echo \"certs_exist=\$([ -f /etc/testnet/certs/cert.pem ] && [ -f /etc/testnet/certs/key.pem ] && [ -f /etc/testnet/certs/ca.pem ] && echo yes || echo no)\"
-            echo \"seeds_exist=\$([ -f /var/lib/testnet-search/seeds.txt ] && echo yes || echo no)\"
+            echo \"seeds_exist=\$([ -f ${DATA_MOUNT}/seeds.txt ] && echo yes || echo no)\"
+
+            echo \"data_mounted=\$(mountpoint -q ${DATA_MOUNT} && echo yes || echo no)\"
 
             SRV_ERR=\$(sudo journalctl -u testnet-search-server --since '5 min ago' --no-pager -p err 2>/dev/null | grep -c '' || echo 0)
             CRL_ERR=\$(sudo journalctl -u testnet-search-crawler --since '5 min ago' --no-pager -p err 2>/dev/null | grep -c '' || echo 0)
@@ -548,7 +762,6 @@ do_test() {
         fi
 
         if $ssh_ok; then
-            # Services
             t_section "Services"
             [ "$(t_val wg_active)" = "active" ]           && t_pass "wg-quick@wg0 is active"                   || t_fail "wg-quick@wg0 is $(t_val wg_active)"
             [ "$(t_val server_active)" = "active" ]        && t_pass "testnet-search-server is active"          || t_fail "testnet-search-server is $(t_val server_active)"
@@ -557,19 +770,17 @@ do_test() {
             [ "$(t_val crawler_enabled)" = "enabled" ]     && t_pass "testnet-search-crawler is enabled (reboot)"|| t_fail "testnet-search-crawler is not enabled"
             [ "$(t_val seeds_timer_active)" = "active" ]   && t_pass "testnet-search-seeds.timer is active"     || t_fail "testnet-search-seeds.timer is $(t_val seeds_timer_active)"
 
-            # Toolkit + files
             t_section "Toolkit & Files"
             [ "$(t_val toolkit_installed)" = "yes" ] && t_pass "testnet-toolkit installed" || t_fail "testnet-toolkit not installed"
             [ "$(t_val certs_exist)" = "yes" ]       && t_pass "TLS certs present in /etc/testnet/certs" || t_fail "TLS certs missing from /etc/testnet/certs"
             [ "$(t_val seeds_exist)" = "yes" ]       && t_pass "seeds.txt present" || t_fail "seeds.txt missing"
+            [ "$(t_val data_mounted)" = "yes" ]      && t_pass "Data volume mounted at ${DATA_MOUNT}" || t_fail "Data volume not mounted at ${DATA_MOUNT}"
 
-            # WireGuard
             t_section "WireGuard Tunnel"
             [ "$(t_val wg_handshake)" = "yes" ] && t_pass "WireGuard handshake present" || t_fail "No WireGuard handshake"
             local dns_result; dns_result=$(t_val dns_result)
             [ -n "$dns_result" ] && t_pass "DNS resolves search.testnet -> ${dns_result}" || t_fail "DNS cannot resolve search.testnet"
 
-            # HTTPS endpoints
             t_section "HTTPS Endpoints"
             [ "$(t_val health)" = "OK" ]            && t_pass "/health returns OK"            || t_fail "/health returned: '$(t_val health)'"
             [ "$(t_val home_status)" = "200" ]       && t_pass "/ returns 200"                || t_fail "/ returned HTTP $(t_val home_status)"
@@ -577,7 +788,6 @@ do_test() {
             [ "$(t_val search_status)" = "200" ]     && t_pass "/search?q=test returns 200"   || t_fail "/search?q=test returned HTTP $(t_val search_status)"
             [ "$(t_val browse_status)" = "200" ]     && t_pass "/browse returns 200"          || t_fail "/browse returned HTTP $(t_val browse_status)"
 
-            # JSON API
             t_section "JSON API"
             [ "$(t_val api_search_valid)" = "yes" ]  && t_pass "/api/search returns valid JSON (query, results, pagination)" || t_fail "/api/search JSON structure invalid"
             [ "$(t_val api_browse_valid)" = "yes" ]  && t_pass "/api/browse returns JSON array"                              || t_fail "/api/browse JSON structure invalid"
@@ -586,7 +796,6 @@ do_test() {
             local notfound; notfound=$(t_val notfound_status)
             [ "$notfound" = "404" ] && t_pass "/nonexistent returns 404" || t_fail "/nonexistent returned HTTP ${notfound} (expected 404)"
 
-            # Process health
             t_section "Process Health"
             local proc_count; proc_count=$(t_val proc_count)
             if [ "$proc_count" = "2" ]; then t_pass "2 testnet-search processes running (server + crawler)"
@@ -606,8 +815,6 @@ do_test() {
         fi
     fi
 
-    # -- Summary --
-
     local total=$((PASS + FAIL + SKIP))
     echo ""
     echo "======================================="
@@ -617,11 +824,56 @@ do_test() {
 
     if [ "$FAIL" -gt 0 ]; then
         echo "Some checks failed. Inspect logs:"
-        echo "  bash deploy/deploy.sh ssh -- sudo journalctl -u testnet-search-server --no-pager -n 50"
-        echo "  bash deploy/deploy.sh ssh -- sudo journalctl -u testnet-search-crawler --no-pager -n 50"
+        echo "  bash deploy/aws-deploy.sh ssh -- sudo journalctl -u testnet-search-server --no-pager -n 50"
+        echo "  bash deploy/aws-deploy.sh ssh -- sudo journalctl -u testnet-search-crawler --no-pager -n 50"
         echo ""
         return 1
     fi
+}
+
+# ---- redeploy ----
+
+do_redeploy() {
+    require_state
+    resolve_key
+
+    local INSTANCE_ID IP_SEARCH
+    INSTANCE_ID=$(load_state "instance_search")
+    IP_SEARCH=$(load_state "ip_search")
+    [ -n "$INSTANCE_ID" ] || err "instance_search missing from state"
+    [ -n "$IP_SEARCH" ]   || err "ip_search missing from state"
+
+    info "Re-deploying code to ${IP_SEARCH} (no infra changes)..."
+
+    package_source
+    upload_and_build "$INSTANCE_ID" "$IP_SEARCH"
+
+    info "Restarting services with new binary..."
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
+        set -e
+        sudo systemctl stop testnet-search-crawler || true
+        sudo systemctl stop testnet-search-server || true
+        sudo systemctl stop testnet-search-seeds.timer || true
+
+        sudo rm -f /etc/testnet/certs/cert.pem /etc/testnet/certs/key.pem /etc/testnet/certs/ca.pem
+
+        sudo systemctl start testnet-search-server
+        sleep 3
+        sudo systemctl start testnet-search-crawler
+        sudo systemctl start testnet-search-seeds.timer
+        sleep 4
+
+        echo '=== Server service status ==='
+        sudo systemctl is-active testnet-search-server || true
+
+        echo '=== Crawler service status ==='
+        sudo systemctl is-active testnet-search-crawler || true
+
+        echo '=== Health check ==='
+        curl -sk --connect-timeout 5 https://localhost/health && echo '' || echo 'WARN: health check not passing yet'
+    "
+
+    info "Redeploy complete"
 }
 
 # ---- restart ----
@@ -631,14 +883,14 @@ do_restart() {
     resolve_key
 
     local INSTANCE_ID IP_SEARCH
-    INSTANCE_ID=$(load_state "instance_id")
+    INSTANCE_ID=$(load_state "instance_search")
     IP_SEARCH=$(load_state "ip_search")
-    [ -n "$INSTANCE_ID" ] || err "instance_id missing from state"
+    [ -n "$INSTANCE_ID" ] || err "instance_search missing from state"
     [ -n "$IP_SEARCH" ]   || err "ip_search missing from state"
 
     info "Restarting testnet-search services on ${IP_SEARCH}..."
 
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
         set -e
 
         echo 'Stopping services...'
@@ -679,25 +931,63 @@ do_restart() {
     info "Restart complete"
 }
 
+# ---- logs ----
+
+do_logs() {
+    require_state
+    resolve_key
+
+    local INSTANCE_ID IP_SEARCH
+    INSTANCE_ID=$(load_state "instance_search")
+    IP_SEARCH=$(load_state "ip_search")
+    [ -n "$INSTANCE_ID" ] || err "instance_search missing from state"
+    [ -n "$IP_SEARCH" ]   || err "ip_search missing from state"
+
+    info "Tailing logs on ${IP_SEARCH}..."
+    push_key "$INSTANCE_ID"
+    exec ssh $SSH_OPTS -i "$KEY_FILE" "ubuntu@${IP_SEARCH}" \
+        "sudo journalctl -f -u testnet-search-server -u testnet-search-crawler"
+}
+
 # ---- status ----
 
 do_status() {
     require_state
-    local inst_id ip state_name
-    inst_id=$(load_state "instance_id")
+
+    local inst_id ip eip_alloc vol_id state_name
+    inst_id=$(load_state "instance_search")
     ip=$(load_state "ip_search")
+    eip_alloc=$(load_state "eip_alloc_id")
+    vol_id=$(load_state "vol_search")
+
     state_name=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$inst_id" \
         --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
 
     echo ""
     echo "testnet-search Status"
     echo "====================="
-    printf "  Instance:  %-22s  %s\n" "$inst_id" "$state_name"
-    printf "  Public IP: %s\n" "$ip"
+    printf "  Instance:   %-22s  %s\n" "$inst_id" "$state_name"
+    printf "  Public IP:  %s" "$ip"
+    [ -n "$eip_alloc" ] && printf " (EIP: %s)" "$eip_alloc"
     echo ""
-    echo "  SSH:     bash deploy/deploy.sh ssh"
-    echo "  Test:    bash deploy/deploy.sh test"
-    echo "  Restart: bash deploy/deploy.sh restart"
+    [ -n "$vol_id" ] && printf "  Data Vol:   %s -> %s\n" "$vol_id" "$DATA_MOUNT"
+    echo ""
+
+    if [ "$state_name" = "running" ]; then
+        resolve_key
+        info "Health check..."
+        local health
+        health=$(remote_exec "$inst_id" "$ip" \
+            "curl -sk --connect-timeout 5 https://localhost/health 2>/dev/null || echo 'UNREACHABLE'" 2>/dev/null || echo "SSH_FAILED")
+        printf "  Health:     %s\n" "$health"
+        echo ""
+    fi
+
+    echo "  SSH:      bash deploy/aws-deploy.sh ssh"
+    echo "  Test:     bash deploy/aws-deploy.sh test"
+    echo "  Restart:  bash deploy/aws-deploy.sh restart"
+    echo "  Redeploy: bash deploy/aws-deploy.sh redeploy"
+    echo "  Logs:     bash deploy/aws-deploy.sh logs"
     echo ""
 }
 
@@ -708,7 +998,7 @@ do_ssh() {
     resolve_key
     local ip inst_id
     ip=$(load_state "ip_search")
-    inst_id=$(load_state "instance_id")
+    inst_id=$(load_state "instance_search")
     [ -n "$ip" ] || err "No IP in state file"
     push_key "$inst_id"
     if [ $# -gt 0 ]; then
@@ -721,12 +1011,22 @@ do_ssh() {
 # ---- teardown ----
 
 do_teardown() {
-    require_state
-    info "Tearing down testnet-search..."
+    local full=false
+    [ "${1:-}" = "--full" ] && full=true
 
-    local inst_id ip_search
-    inst_id=$(load_state "instance_id")
-    ip_search=$(load_state "ip_search")
+    require_state
+
+    if $full; then
+        info "Full teardown of testnet-search (destroying all resources)..."
+    else
+        info "Soft teardown of testnet-search (keeping EIP + data volume)..."
+    fi
+
+    local inst_id
+    inst_id=$(load_state "instance_search")
+
+    # Detach data volume before terminating instance
+    detach_volume "search"
 
     if [ -n "$inst_id" ]; then
         info "Terminating instance: ${inst_id}..."
@@ -735,8 +1035,36 @@ do_teardown() {
         aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$inst_id" 2>/dev/null || true
     fi
 
-    rm -f "$STATE_FILE"
-    info "Teardown complete."
+    if $full; then
+        # Release EIP
+        local eip_alloc
+        eip_alloc=$(load_state "eip_alloc_id")
+        if [ -n "$eip_alloc" ]; then
+            info "Releasing Elastic IP ${eip_alloc}..."
+            aws ec2 release-address --region "$REGION" --allocation-id "$eip_alloc" 2>/dev/null || true
+        fi
+
+        # Delete data volume
+        delete_volume "search"
+
+        rm -f "$STATE_FILE"
+        info "Full teardown complete. State file removed."
+    else
+        # Prune state to keep only persistent keys
+        local eip_alloc eip_ip vol_search az
+        eip_alloc=$(load_state "eip_alloc_id")
+        eip_ip=$(load_state "eip_public_ip")
+        vol_search=$(load_state "vol_search")
+        az=$(load_state "az")
+
+        echo '{}' > "$STATE_FILE"
+        [ -n "$eip_alloc" ]  && save_state "eip_alloc_id" "$eip_alloc"
+        [ -n "$eip_ip" ]     && save_state "eip_public_ip" "$eip_ip"
+        [ -n "$vol_search" ] && save_state "vol_search" "$vol_search"
+        [ -n "$az" ]         && save_state "az" "$az"
+
+        info "Soft teardown complete. EIP and data volume preserved."
+    fi
 
     echo ""
     echo "  Ask the testnet server operator to remove the \"search\""
@@ -751,27 +1079,26 @@ do_reindex() {
     resolve_key
 
     local INSTANCE_ID IP_SEARCH
-    INSTANCE_ID=$(load_state "instance_id")
+    INSTANCE_ID=$(load_state "instance_search")
     IP_SEARCH=$(load_state "ip_search")
-    [ -n "$INSTANCE_ID" ] || err "instance_id missing from state"
+    [ -n "$INSTANCE_ID" ] || err "instance_search missing from state"
     [ -n "$IP_SEARCH" ]   || err "ip_search missing from state"
 
     info "Triggering re-index on ${IP_SEARCH}..."
 
-    # Refresh seeds, then restart the crawler (initial crawl runs immediately on start)
-    remote "$INSTANCE_ID" "$IP_SEARCH" "
+    remote_exec "$INSTANCE_ID" "$IP_SEARCH" "
         set -e
 
         echo 'Refreshing seed domains...'
         sudo systemctl start testnet-search-seeds.service
-        echo \"Seeds: \$(cat /var/lib/testnet-search/seeds.txt | wc -l) domains\"
-        cat /var/lib/testnet-search/seeds.txt
+        echo \"Seeds: \$(cat ${DATA_MOUNT}/seeds.txt | wc -l) domains\"
+        cat ${DATA_MOUNT}/seeds.txt
 
         echo ''
         echo 'Restarting crawler (triggers immediate crawl)...'
         sudo systemctl restart testnet-search-crawler
 
-        DOMAIN_COUNT=\$(cat /var/lib/testnet-search/seeds.txt | wc -l)
+        DOMAIN_COUNT=\$(cat ${DATA_MOUNT}/seeds.txt | wc -l)
         echo \"Waiting for crawl to finish (\${DOMAIN_COUNT} domains)...\"
         for i in \$(seq 1 120); do
             FINISHED=\$(sudo journalctl -u testnet-search-crawler --since '5 min ago' --no-pager 2>/dev/null | grep -c 'finished.*pages indexed' || true)
@@ -806,12 +1133,14 @@ do_reindex() {
 ACTION="${1:-}"
 case "$ACTION" in
     deploy)   do_deploy ;;
-    test)     shift; do_test "$@" ;;
-    restart)  do_restart ;;
-    reindex)  do_reindex ;;
-    teardown) do_teardown ;;
+    teardown) do_teardown "${2:-}" ;;
     status)   do_status ;;
     ssh)      shift; do_ssh "$@" ;;
-    "")       err "Usage: $0 <deploy|test|restart|reindex|teardown|status|ssh>" ;;
-    *)        err "Unknown action: $ACTION. Use: deploy, test, restart, reindex, teardown, status, ssh" ;;
+    redeploy) do_redeploy ;;
+    restart)  do_restart ;;
+    logs)     do_logs ;;
+    test)     shift; do_test "$@" ;;
+    reindex)  do_reindex ;;
+    "")       err "Usage: $0 <deploy|teardown [--full]|status|ssh|redeploy|restart|logs|test|reindex>" ;;
+    *)        err "Unknown action: $ACTION" ;;
 esac
