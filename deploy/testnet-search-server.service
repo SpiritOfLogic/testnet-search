@@ -1,0 +1,22 @@
+[Unit]
+Description=Testnet Search Engine - HTTPS Server
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/testnet-search/env
+ExecStartPre=/usr/local/bin/testnet-toolkit certs fetch \
+    --server-url ${SERVER_URL} --name search --secret ${NODE_SECRET} \
+    --out-dir /etc/testnet/certs
+ExecStart=/usr/local/bin/testnet-search serve \
+    --cert-dir /etc/testnet/certs \
+    --listen :443 \
+    --data-dir /var/lib/testnet-search
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/testnet-search
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

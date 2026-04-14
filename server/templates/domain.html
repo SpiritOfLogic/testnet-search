@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{.Domain}} - Testnet Search</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #fafafa; color: #222; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header a { text-decoration: none; color: #222; font-weight: bold; font-size: 1.3em; }
+        .breadcrumb { margin: 16px 0; color: #666; font-size: 0.95em; }
+        .breadcrumb a { color: #1a0dab; text-decoration: none; }
+        .breadcrumb a:hover { text-decoration: underline; }
+        h2 { margin-top: 8px; }
+        .page-list { list-style: none; padding: 0; }
+        .page-item { padding: 14px 20px; margin-bottom: 8px; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; }
+        .page-item h3 { margin: 0 0 4px; font-size: 1.1em; }
+        .page-item h3 a { color: #1a0dab; text-decoration: none; }
+        .page-item h3 a:hover { text-decoration: underline; }
+        .page-item .url { color: #006621; font-size: 0.85em; margin-bottom: 4px; }
+        .page-item .desc { color: #444; font-size: 0.9em; }
+        .empty { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="/">Testnet Search</a>
+        </div>
+        <div class="breadcrumb">
+            <a href="/browse">All sites</a> &rsaquo; {{.Domain}}
+        </div>
+        <h2>{{.Domain}}</h2>
+        {{if .Pages}}
+        <ul class="page-list">
+            {{range .Pages}}
+            <li class="page-item">
+                <h3><a href="{{.URL}}">{{if .Title}}{{.Title}}{{else}}{{.URL}}{{end}}</a></h3>
+                <div class="url">{{.URL}}</div>
+                {{if .Description}}<div class="desc">{{.Description}}</div>{{end}}
+            </li>
+            {{end}}
+        </ul>
+        {{else}}
+        <p class="empty">No pages found for this domain.</p>
+        {{end}}
+    </div>
+</body>
+</html>

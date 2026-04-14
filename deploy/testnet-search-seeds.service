@@ -1,0 +1,7 @@
+[Unit]
+Description=Testnet Search Engine - Refresh Seed Domains
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/testnet-search/env
+ExecStart=/bin/bash -c '/usr/local/bin/testnet-toolkit seed domains --server-url ${SERVER_URL} --api-token ${API_TOKEN} --exclude-node search > /var/lib/testnet-search/seeds.txt'

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Browse Sites - Testnet Search</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #fafafa; color: #222; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header a { text-decoration: none; color: #222; font-weight: bold; font-size: 1.3em; }
+        h2 { margin-top: 24px; }
+        .domain-list { list-style: none; padding: 0; }
+        .domain-item { padding: 16px 20px; margin-bottom: 8px; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; }
+        .domain-item a { font-size: 1.15em; color: #1a0dab; text-decoration: none; font-weight: 500; }
+        .domain-item a:hover { text-decoration: underline; }
+        .domain-meta { color: #666; font-size: 0.9em; margin-top: 4px; }
+        .empty { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="/">Testnet Search</a>
+        </div>
+        <h2>All Sites</h2>
+        {{if .Domains}}
+        <ul class="domain-list">
+            {{range .Domains}}
+            <li class="domain-item">
+                <a href="/browse/{{.Domain}}">{{.Domain}}</a>
+                <div class="domain-meta">{{.PageCount}} pages &middot; last crawled {{.LastCrawled}}</div>
+            </li>
+            {{end}}
+        </ul>
+        {{else}}
+        <p class="empty">No sites have been indexed yet. The crawler may still be running.</p>
+        {{end}}
+    </div>
+</body>
+</html>

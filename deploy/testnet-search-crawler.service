@@ -1,0 +1,26 @@
+[Unit]
+Description=Testnet Search Engine - Sandboxed Crawler
+After=network-online.target wg-quick@wg0.service testnet-search-server.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/testnet-search/env
+ExecStartPre=/bin/bash -c '/usr/local/bin/testnet-toolkit seed domains --server-url ${SERVER_URL} --api-token ${API_TOKEN} --exclude-node search > /var/lib/testnet-search/seeds.txt'
+ExecStart=/usr/local/bin/testnet-toolkit sandbox run \
+    --dns-ip ${DNS_IP} \
+    --ca-cert /etc/testnet/certs/ca.pem \
+    --wg-interface wg0 \
+    -- /usr/local/bin/testnet-search crawl \
+    --cert-dir /etc/testnet/certs \
+    --dns-ip ${DNS_IP} \
+    --seed-file /var/lib/testnet-search/seeds.txt \
+    --data-dir /var/lib/testnet-search \
+    --continuous
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/var/lib/testnet-search
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
