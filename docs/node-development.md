@@ -35,7 +35,7 @@ The testnet has three roles:
 When an agent inside a VM tries to visit `github.com`:
 
 1. The VM's DNS resolver queries the testnet DNS server (there is no other DNS available)
-2. If `github.com` is a declared testnet domain, DNS returns a Virtual IP (VIP) in `10.100.0.0/16`; otherwise it returns NXDOMAIN (domain not found)
+2. If `github.com` is a declared testnet domain, DNS returns a Virtual IP (VIP) in `83.150.0.0/16`; otherwise it returns NXDOMAIN (domain not found)
 3. The VM sends HTTPS traffic to the VIP, which travels through the WireGuard tunnel to the server
 4. The server uses iptables DNAT (Destination NAT) to rewrite the VIP to your node's real public IP address and forwards the traffic
 5. Your node receives the request, processes it, and sends the response back along the same path
@@ -60,7 +60,7 @@ The server runs a private certificate authority (CA). Nodes fetch TLS certificat
 A node is any service that agents can interact with on the testnet. From an agent's perspective, nodes look like regular websites -- they resolve via DNS and serve HTTPS. Under the hood, each node:
 
 1. Is declared in the server's `nodes.yaml` with a name, address, secret, and list of domains
-2. Receives a Virtual IP (VIP) in `10.100.0.0/16` for each of its domains
+2. Receives a Virtual IP (VIP) in `83.150.0.0/16` for each of its domains
 3. Fetches TLS certificates from the testnet CA so agents trust its HTTPS
 4. Serves traffic on a real host:port that the server DNATs to from the VIP
 
@@ -68,9 +68,9 @@ A node is any service that agents can interact with on the testnet. From an agen
 Agent VM                    Server                         Node
   |                           |                              |
   |-- DNS: github.com ------->|                              |
-  |<-- A 10.100.0.5 ---------|                              |
+  |<-- A 83.150.0.5 ---------|                              |
   |                           |                              |
-  |-- HTTPS 10.100.0.5:443 ->|-- DNAT to 203.0.113.1:443 ->|
+  |-- HTTPS 83.150.0.5:443 ->|-- DNAT to 203.0.113.1:443 ->|
   |<-- response --------------|<-- response -----------------|
 ```
 
@@ -94,7 +94,7 @@ testnet-hosting/            # static web hosting + domain registration
 testnet-messenger/          # Telegram-like messaging
 ```
 
-Every node repo imports `github.com/agent-testnet/agent-testnet/pkg/api` for the control plane client and shared types.
+Every node repo imports `github.com/SpiritOfLogic/agent-testnet/pkg/api` for the control plane client and shared types.
 
 ## Minimal node example
 
@@ -109,7 +109,7 @@ import (
     "log"
     "net/http"
 
-    "github.com/agent-testnet/agent-testnet/pkg/api"
+    "github.com/SpiritOfLogic/agent-testnet/pkg/api"
 )
 
 func main() {
@@ -152,9 +152,11 @@ func main() {
 
 **Note on the bootstrap TLS call**: `api.NewServerClient(url, nil)` disables TLS verification for the initial connection to the control plane. This is safe because the control plane uses a self-signed certificate (not issued by a public CA). After fetching the CA cert, you can create a new client with `api.NewServerClient(url, caCert)` to verify all subsequent calls. For simple passive nodes that only fetch certs at startup, the nil-CA bootstrap is sufficient.
 
+**Using existing applications instead of custom Go code?** If you're wrapping an off-the-shelf application (Gitea, DokuWiki, etc.) rather than writing a custom binary, use `testnet-toolkit certs fetch` to write certificates to disk, then point nginx or Caddy at them. See the [Node Toolkit](design_documents/node-toolkit-design.md) design document and the [Toolkit Reference](toolkit-reference.md) for details.
+
 ## The `pkg/api` Go package
 
-Your node imports `github.com/agent-testnet/agent-testnet/pkg/api`. This package provides:
+Your node imports `github.com/SpiritOfLogic/agent-testnet/pkg/api`. This package provides:
 
 **`api.ServerClient`** -- HTTP client for the control plane API:
 
@@ -195,7 +197,7 @@ type RegisterResponse struct {
     TunnelCIDR   string `json:"tunnel_cidr"`           // your WireGuard address (e.g. "10.99.1.0/24")
     ServerWGKey  string `json:"server_wg_public_key"`  // server's WireGuard public key
     ServerWGAddr string `json:"server_wg_addr"`        // server's tunnel address (e.g. "10.99.0.1/16")
-    DNSIP        string `json:"dns_ip"`                // testnet DNS VIP (e.g. "10.100.0.1")
+    DNSIP        string `json:"dns_ip"`                // testnet DNS VIP (e.g. "83.150.0.1")
     CACert       string `json:"ca_cert"`               // testnet root CA cert (PEM)
 }
 
@@ -207,7 +209,7 @@ type NodeInfo struct {
 
 type DomainMapping struct {
     Domain string `json:"domain"` // e.g. "google.com" or "search.testnet"
-    VIP    string `json:"vip"`    // e.g. "10.100.0.2"
+    VIP    string `json:"vip"`    // e.g. "83.150.0.2"
     Node   string `json:"node"`   // owning node name
 }
 ```
@@ -267,7 +269,7 @@ Response:
   "tunnel_cidr": "10.99.1.0/24",
   "server_wg_public_key": "<base64>",
   "server_wg_addr": "10.99.0.1/16",
-  "dns_ip": "10.100.0.1",
+  "dns_ip": "83.150.0.1",
   "ca_cert": "-----BEGIN CERTIFICATE-----\n..."
 }
 ```
@@ -282,7 +284,7 @@ Lists all nodes with their VIPs and domains. Auth: API token.
 [
   {
     "name": "example-node",
-    "vip": "10.100.0.2",
+    "vip": "83.150.0.2",
     "domains": ["google.com", "www.google.com"]
   }
 ]
@@ -294,8 +296,8 @@ Lists all domain-to-VIP mappings (including auto-names like `{name}.testnet`). A
 
 ```json
 [
-  { "domain": "google.com",           "vip": "10.100.0.2", "node": "example-node" },
-  { "domain": "example-node.testnet", "vip": "10.100.0.2", "node": "example-node" }
+  { "domain": "google.com",           "vip": "83.150.0.2", "node": "example-node" },
+  { "domain": "example-node.testnet", "vip": "83.150.0.2", "node": "example-node" }
 ]
 ```
 
@@ -345,6 +347,8 @@ An active node must:
 4. **Discover domains** -- calls `GET /api/v1/domains` to learn what's available
 5. **Trust the testnet CA** -- uses the CA cert when making HTTPS requests to other nodes
 
+**Wrapping an existing application?** For confining an off-the-shelf application's outbound traffic to the testnet without writing custom Go code, use `testnet-toolkit sandbox run`. It creates a network namespace where only testnet VIPs are reachable. Use `testnet-toolkit seed urls` to discover what domains exist. See the [Node Toolkit](design_documents/node-toolkit-design.md) and the [sandboxed crawler deployment guide](deployment_guides/guide-deploy-crawler.md).
+
 ### WireGuard tunnel setup
 
 The WireGuard tunnel connects your node to the testnet's VIP network. Without it, your node can serve agents (via DNAT) but cannot reach other nodes.
@@ -352,7 +356,7 @@ The WireGuard tunnel connects your node to the testnet's VIP network. Without it
 The tunnel topology:
 - Server's tunnel address: `10.99.0.1/16` (the WireGuard hub)
 - Each client gets a `/24` slice (e.g. `10.99.1.0/24`)
-- Through the tunnel, your node can reach the VIP range `10.100.0.0/16` and the testnet DNS at `10.100.0.1`
+- Through the tunnel, your node can reach the VIP range `83.150.0.0/16` and the testnet DNS at `83.150.0.1`
 
 After registering as a client via `POST /api/v1/clients/register`, you receive the parameters to build a WireGuard config. Example `wg0.conf`:
 
@@ -364,11 +368,11 @@ Address = 10.99.1.1/24          # first usable IP in your tunnel_cidr
 [Peer]
 PublicKey = <server_wg_public_key from registration response>
 Endpoint = SERVER_PUBLIC_IP:51820
-AllowedIPs = 10.99.0.0/16, 10.100.0.0/16
+AllowedIPs = 10.99.0.0/16, 83.150.0.0/16
 PersistentKeepalive = 25
 ```
 
-The `AllowedIPs` routes both the tunnel network (`10.99.0.0/16`) and the VIP network (`10.100.0.0/16`) through the tunnel. Bring it up with:
+The `AllowedIPs` routes both the tunnel network (`10.99.0.0/16`) and the VIP network (`83.150.0.0/16`) through the tunnel. Bring it up with:
 
 ```bash
 sudo wg-quick up ./wg0.conf
@@ -396,7 +400,7 @@ reg, _ := client.Register(joinToken, &api.RegisterRequest{
 // reg.APIToken     -- use for authenticated API calls going forward
 // reg.TunnelCIDR   -- your WireGuard address range
 // reg.ServerWGKey  -- server's WireGuard public key
-// reg.DNSIP        -- testnet DNS address (e.g. "10.100.0.1")
+// reg.DNSIP        -- testnet DNS address (e.g. "83.150.0.1")
 // reg.CACert       -- testnet root CA (PEM)
 
 // 5. Set up WireGuard (externally or programmatically)
@@ -412,6 +416,8 @@ domains, _ := client.ListDomains()
 ```
 
 ## Deployment
+
+For AWS deployment scripting conventions (file layout, required actions, persistence with Elastic IP + EBS volumes), see the [Deploy Script Conventions](deploy-script-conventions.md).
 
 ### Server-side setup
 
@@ -470,6 +476,6 @@ For active nodes that also need tunnel access, provide the join token:
 - **Domain choice**: You can claim real-world domain names (e.g. `google.com`) since testnet DNS is authoritative and isolated. Agents will believe they're talking to the real service.
 - **Auto-names**: Every node automatically gets `{name}.testnet` as a domain, even if no explicit domains are declared. This is useful for infrastructure services like `search.testnet`.
 - **CA cert for outbound requests**: When making HTTPS requests to other testnet nodes, build a custom `tls.Config` with the testnet CA cert in the root pool. The standard system CA store won't trust testnet certificates.
-- **DNS resolution**: Inside the WireGuard tunnel, configure your resolver to use the testnet DNS. The DNS VIP address (typically `10.100.0.1`) is returned in the `dns_ip` field of the client registration response. Use a custom `net.Resolver` with a dialer pointed at `{dns_ip}:53`, or configure the system resolver.
+- **DNS resolution**: Inside the WireGuard tunnel, configure your resolver to use the testnet DNS. The DNS VIP address (typically `83.150.0.1`) is returned in the `dns_ip` field of the client registration response. Use a custom `net.Resolver` with a dialer pointed at `{dns_ip}:53`, or configure the system resolver.
 - **Health checks**: Implement a `/health` endpoint. While not required by the control plane today, it's good practice and may be used for monitoring in the future.
 - **Graceful reload**: Poll `GET /api/v1/domains` periodically to discover new nodes without restarting. The server supports live reload of `nodes.yaml` via `SIGHUP`.
